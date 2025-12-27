@@ -1,5 +1,7 @@
 # suear-mjpeg-over-adb
 
+![screenshot](screenshot.png)
+
 Streams the Suear live-preview video over USB by capturing the phone’s UDP traffic and serving it as MJPEG on your computer.
 
 ## What it does
