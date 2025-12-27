@@ -1,0 +1,21 @@
+{
+  "name": "suear-mjpeg-over-adb",
+  "version": "0.1.0",
+  "description": "Capture Suear UDP live preview from an Android phone over USB (adb) and serve it as MJPEG locally.",
+  "scripts": {
+    "start": "node bin/suear-mjpeg-over-adb.js"
+  },
+  "bin": {
+    "suear-mjpeg-over-adb": "bin/suear-mjpeg-over-adb.js"
+  },
+  "keywords": [
+    "adb",
+    "android",
+    "mjpeg",
+    "pcap",
+    "tcpdump",
+    "udp"
+  ],
+  "license": "ISC",
+  "type": "commonjs"
+}
