@@ -10,9 +10,7 @@ Streams the Suear live-preview video over USB by capturing the phone’s UDP tra
 - Streams that PCAP file over a device-local TCP socket (`tail -f … | nc -l`).
 - Uses `adb forward` to bring that TCP socket to `127.0.0.1:<port>` on your computer.
 - Parses Ethernet/IP/UDP frames from the PCAP stream, extracts UDP payloads, and reassembles JPEG frames.
-- Serves:
-  - `http://127.0.0.1:8081/mjpeg` (continuous MJPEG stream)
-  - `http://127.0.0.1:8081/frame.jpg` (latest single JPEG)
+- Serves: `http://127.0.0.1:8081/mjpeg` (continuous MJPEG stream)
 
 This avoids trying to forward UDP directly (ADB port forwarding is TCP/Unix-socket only).
 
@@ -51,6 +49,6 @@ SUEAR_HTTP_PORT=8099 SUEAR_DEBUG=1 npm start
 
 ## Notes / troubleshooting
 
-- If the server says “no frame yet”, start live preview in the Suear app (so the phone is actually receiving the UDP stream).
+- If `/mjpeg` stays blank, start live preview in the Suear app (so the phone is actually receiving the UDP stream).
 - If `adb forward` succeeds but no bytes arrive, the on-device tools (`tcpdump`, `nc`) may be missing, or `su` may be denied.
 - The capture file is created on-device at `/data/local/tmp/suear-stream-<forwardPort>.pcap`.

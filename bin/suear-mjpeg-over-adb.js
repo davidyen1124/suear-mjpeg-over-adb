@@ -255,24 +255,9 @@ function start() {
 
   const clients = new Set();
   const server = http.createServer((req, res) => {
-    if (req.url === '/frame.jpg') {
-      if (!lastFrame) {
-        res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end('no frame yet (start live preview in the Suear app)\n');
-        return;
-      }
-      res.writeHead(200, {
-        'cache-control': 'no-cache',
-        'pragma': 'no-cache',
-        'content-type': 'image/jpeg',
-        'content-length': String(lastFrame.length),
-      });
-      res.end(lastFrame);
-      return;
-    }
     if (req.url !== '/mjpeg') {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end('OK. Use /mjpeg or /frame.jpg\n');
+      res.end('OK. Use /mjpeg\n');
       return;
     }
     res.writeHead(200, {
