@@ -68,105 +68,105 @@ class JpegAssembler {
   }
 }
 
-function parsePcapStream(onPacket) {
-  let buf = Buffer.alloc(0);
-  let pcap = null;
+class PcapStreamParser {
+  constructor(onPacket) {
+    this.onPacket = onPacket;
+    this.buf = Buffer.alloc(0);
+    this.pcap = null;
+    this.debug = process.env.SUEAR_DEBUG === '1';
+  }
 
-  const DEBUG_PCAP = process.env.SUEAR_DEBUG === '1';
+  need(n) {
+    return this.buf.length >= n;
+  }
 
-  function stripTcpdumpBanner() {
+  drain(n) {
+    this.buf = this.buf.subarray(n);
+  }
+
+  readU32(off, le) {
+    return le ? this.buf.readUInt32LE(off) : this.buf.readUInt32BE(off);
+  }
+
+  stripTcpdumpBanner() {
     // Android tcpdump sometimes writes its "listening on ..." banner to stdout,
     // which corrupts the binary pcap stream. Strip any leading ASCII line(s)
     // starting with "tcpdump:".
-    while (buf.length >= 8 && buf.subarray(0, 8).toString('ascii') === 'tcpdump:') {
-      const nl = buf.indexOf(0x0a);
+    while (this.buf.length >= 8 && this.buf.subarray(0, 8).toString('ascii') === 'tcpdump:') {
+      const nl = this.buf.indexOf(0x0a);
       if (nl === -1) return false; // need more bytes
-      buf = buf.subarray(nl + 1);
+      this.buf = this.buf.subarray(nl + 1);
     }
     return true;
   }
 
-  function tryResync(le) {
+  tryResync(le) {
     // Scan forward a bit for a plausible per-packet header.
     // header: ts_sec(u32), ts_usec(u32), incl_len(u32), orig_len(u32)
-    const maxScan = Math.min(buf.length - 16, 4096);
+    const maxScan = Math.min(this.buf.length - 16, 4096);
     for (let i = 0; i <= maxScan; i++) {
-      const tsUsec = le ? buf.readUInt32LE(i + 4) : buf.readUInt32BE(i + 4);
-      const inclLen = le ? buf.readUInt32LE(i + 8) : buf.readUInt32BE(i + 8);
-      const origLen = le ? buf.readUInt32LE(i + 12) : buf.readUInt32BE(i + 12);
+      const tsUsec = le ? this.buf.readUInt32LE(i + 4) : this.buf.readUInt32BE(i + 4);
+      const inclLen = le ? this.buf.readUInt32LE(i + 8) : this.buf.readUInt32BE(i + 8);
+      const origLen = le ? this.buf.readUInt32LE(i + 12) : this.buf.readUInt32BE(i + 12);
       if (tsUsec > 1_000_000) continue;
       if (inclLen !== origLen) continue;
       if (inclLen < 14 || inclLen > 262_144) continue;
-      if (i !== 0 && DEBUG_PCAP) console.log(`[pcap] resync +${i} (inclLen=${inclLen})`);
-      buf = buf.subarray(i);
+      if (i !== 0 && this.debug) console.log(`[pcap] resync +${i} (inclLen=${inclLen})`);
+      this.buf = this.buf.subarray(i);
       return true;
     }
     return false;
   }
 
-  function need(n) {
-    return buf.length >= n;
-  }
+  push(data) {
+    this.buf = Buffer.concat([this.buf, data]);
 
-  function readU32(off, le) {
-    return le ? buf.readUInt32LE(off) : buf.readUInt32BE(off);
-  }
-
-  function drain(n) {
-    buf = buf.subarray(n);
-  }
-
-  return {
-    push(data) {
-      buf = Buffer.concat([buf, data]);
-
-      if (!pcap) {
-      if (!need(24)) return;
-      const magicBE = buf.readUInt32BE(0);
-      const magicLE = buf.readUInt32LE(0);
+    if (!this.pcap) {
+      if (!this.need(24)) return;
+      const magicBE = this.buf.readUInt32BE(0);
+      const magicLE = this.buf.readUInt32LE(0);
       let le = null;
-        // microsecond-resolution PCAP (common)
-        if (magicBE === 0xa1b2c3d4) le = false;
-        else if (magicLE === 0xa1b2c3d4) le = true;
-        // nanosecond-resolution PCAP (less common)
-        else if (magicBE === 0xa1b23c4d) le = false;
-        else if (magicLE === 0xa1b23c4d) le = true;
-        else throw new Error(`Unknown pcap magic: be=0x${magicBE.toString(16)} le=0x${magicLE.toString(16)}`);
+      // microsecond-resolution PCAP (common)
+      if (magicBE === 0xa1b2c3d4) le = false;
+      else if (magicLE === 0xa1b2c3d4) le = true;
+      // nanosecond-resolution PCAP (less common)
+      else if (magicBE === 0xa1b23c4d) le = false;
+      else if (magicLE === 0xa1b23c4d) le = true;
+      else throw new Error(`Unknown pcap magic: be=0x${magicBE.toString(16)} le=0x${magicLE.toString(16)}`);
 
-        const network = le ? buf.readUInt32LE(20) : buf.readUInt32BE(20);
-        pcap = { le, network };
-        if (pcap.network !== 1) {
-          throw new Error(`Unsupported pcap linktype=${pcap.network} (expected 1/EN10MB).`);
-        }
-        if (DEBUG_PCAP) console.log(`[pcap] header ok le=${pcap.le} linktype=${pcap.network}`);
-        drain(24);
+      const network = le ? this.buf.readUInt32LE(20) : this.buf.readUInt32BE(20);
+      this.pcap = { le, network };
+      if (this.pcap.network !== 1) {
+        throw new Error(`Unsupported pcap linktype=${this.pcap.network} (expected 1/EN10MB).`);
       }
+      if (this.debug) console.log(`[pcap] header ok le=${this.pcap.le} linktype=${this.pcap.network}`);
+      this.drain(24);
+    }
 
-      if (pcap && !stripTcpdumpBanner()) return;
+    if (this.pcap && !this.stripTcpdumpBanner()) return;
 
-      while (need(16)) {
-        if (!stripTcpdumpBanner()) return;
-        const le = pcap.le;
-        const inclLen = readU32(8, le);
-        const origLen = readU32(12, le);
-        const tsUsec = readU32(4, le);
-        if (tsUsec > 1_000_000 || inclLen !== origLen || inclLen < 14 || inclLen > 262_144) {
-          if (!tryResync(le)) {
-            if (DEBUG_PCAP) {
-              const preview = buf.subarray(0, Math.min(buf.length, 64));
-              console.log(`[pcap] desync (tsUsec=${tsUsec} incl=${inclLen} orig=${origLen}) next=${preview.toString('hex')}`);
-            }
-            return;
+    while (this.need(16)) {
+      if (!this.stripTcpdumpBanner()) return;
+      const le = this.pcap.le;
+      const inclLen = this.readU32(8, le);
+      const origLen = this.readU32(12, le);
+      const tsUsec = this.readU32(4, le);
+      if (tsUsec > 1_000_000 || inclLen !== origLen || inclLen < 14 || inclLen > 262_144) {
+        if (!this.tryResync(le)) {
+          if (this.debug) {
+            const preview = this.buf.subarray(0, Math.min(this.buf.length, 64));
+            console.log(`[pcap] desync (tsUsec=${tsUsec} incl=${inclLen} orig=${origLen}) next=${preview.toString('hex')}`);
           }
-          continue;
+          return;
         }
-        if (!need(16 + inclLen)) return;
-        const pkt = buf.subarray(16, 16 + inclLen);
-        drain(16 + inclLen);
-        onPacket(pkt);
+        continue;
       }
-    },
-  };
+      if (!this.need(16 + inclLen)) return;
+      const pkt = this.buf.subarray(16, 16 + inclLen);
+      this.drain(16 + inclLen);
+      this.onPacket(pkt);
+    }
+  }
 }
 
 function decodeUdpPayloadFromEthernetFrame(frame) {
@@ -278,7 +278,7 @@ function start() {
     console.log(`MJPEG server: http://127.0.0.1:${HTTP_PORT}/mjpeg`);
   });
 
-  const pcap = parsePcapStream((pkt) => {
+  const pcap = new PcapStreamParser((pkt) => {
     pcapPackets++;
     const udp = decodeUdpPayloadFromEthernetFrame(pkt);
     if (!udp) return;
