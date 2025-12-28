@@ -11,6 +11,7 @@ const IFACE = process.env.SUEAR_IFACE || 'wlan0';
 const HTTP_PORT = Number(process.env.SUEAR_HTTP_PORT || '8081');
 const DEBUG = process.env.SUEAR_DEBUG === '1';
 const FORWARD_PORT = Number(process.env.SUEAR_FORWARD_PORT || '27183');
+const EMPTY = Buffer.alloc(0);
 
 function indexOfMarker(buf, a, b, start = 0) {
   for (let i = start; i + 1 < buf.length; i++) {
@@ -19,48 +20,169 @@ function indexOfMarker(buf, a, b, start = 0) {
   return -1;
 }
 
+class ByteQueue {
+  constructor(initialCapacity = 64 * 1024) {
+    this.buf = Buffer.alloc(initialCapacity);
+    this.start = 0;
+    this.end = 0;
+  }
+
+  get length() {
+    return this.end - this.start;
+  }
+
+  _ensureCapacity(extra) {
+    const len = this.length;
+    const needed = len + extra;
+
+    if (needed <= this.buf.length) {
+      if (this.end + extra <= this.buf.length) return;
+      if (this.start > 0) {
+        this.buf.copy(this.buf, 0, this.start, this.end);
+        this.start = 0;
+        this.end = len;
+        return;
+      }
+    }
+
+    let cap = Math.max(this.buf.length, 1024);
+    while (cap < needed) cap *= 2;
+    const next = Buffer.alloc(cap);
+    if (len > 0) this.buf.copy(next, 0, this.start, this.end);
+    this.buf = next;
+    this.start = 0;
+    this.end = len;
+  }
+
+  push(data) {
+    if (!data || data.length === 0) return;
+    this._ensureCapacity(data.length);
+    data.copy(this.buf, this.end);
+    this.end += data.length;
+  }
+
+  drain(n) {
+    if (n > this.length) throw new RangeError(`drain(${n}) exceeds length=${this.length}`);
+    this.start += n;
+    if (this.start === this.end) {
+      this.start = 0;
+      this.end = 0;
+    }
+  }
+
+  peek(n) {
+    if (n > this.length) throw new RangeError(`peek(${n}) exceeds length=${this.length}`);
+    return this.buf.subarray(this.start, this.start + n);
+  }
+
+  subarray(relStart, relEnd) {
+    return this.buf.subarray(this.start + relStart, this.start + relEnd);
+  }
+
+  indexOf(byte, relFrom = 0) {
+    const view = this.buf.subarray(this.start, this.end);
+    return view.indexOf(byte, relFrom);
+  }
+
+  readUInt32LE(off) {
+    return this.buf.readUInt32LE(this.start + off);
+  }
+
+  readUInt32BE(off) {
+    return this.buf.readUInt32BE(this.start + off);
+  }
+}
+
 class JpegAssembler {
   constructor() {
     this.collecting = false;
-    this.buf = Buffer.alloc(0);
+    this.chunks = [];
+    this.totalBytes = 0;
+    this.prevByte = null;
+    this.carryByte = null; // for split SOI across chunk boundaries when not collecting
     this.maxFrameBytes = 5 * 1024 * 1024;
+  }
+
+  _resetFrame() {
+    this.collecting = false;
+    this.chunks = [];
+    this.totalBytes = 0;
+    this.prevByte = null;
+  }
+
+  _pushFrameChunk(buf) {
+    if (!buf || buf.length === 0) return;
+    this.chunks.push(buf);
+    this.totalBytes += buf.length;
+    this.prevByte = buf[buf.length - 1];
+  }
+
+  _finishFrame() {
+    const frame =
+      this.chunks.length === 1 && this.chunks[0].length === this.totalBytes
+        ? this.chunks[0]
+        : Buffer.concat(this.chunks, this.totalBytes);
+    this._resetFrame();
+    return frame;
   }
 
   feed(chunk) {
     const frames = [];
-    let data = chunk;
+    let data = chunk || EMPTY;
 
     while (data.length > 0) {
       if (!this.collecting) {
-        const soi = indexOfMarker(data, 0xff, 0xd8);
-        if (soi === -1) break;
-        this.collecting = true;
-        this.buf = data.subarray(soi);
-        data = Buffer.alloc(0);
-      } else {
-        this.buf = Buffer.concat([this.buf, data]);
-        data = Buffer.alloc(0);
+        if (this.carryByte === 0xff && data[0] === 0xd8) {
+          // SOI split across chunk boundary: previous ended with 0xff, new begins with 0xd8.
+          this.collecting = true;
+          this.chunks = [Buffer.from([0xff])];
+          this.totalBytes = 1;
+          this.prevByte = 0xff;
+          this.carryByte = null;
+        } else {
+          const soi = indexOfMarker(data, 0xff, 0xd8);
+          if (soi === -1) {
+            this.carryByte = data[data.length - 1] === 0xff ? 0xff : null;
+            break;
+          }
+          this.collecting = true;
+          this.chunks = [];
+          this.totalBytes = 0;
+          this.prevByte = null;
+          this.carryByte = null;
+          data = data.subarray(soi);
+        }
       }
 
-      if (this.buf.length > this.maxFrameBytes) {
-        this.collecting = false;
-        this.buf = Buffer.alloc(0);
-        break;
-      }
-
-      // There may be multiple frames buffered; emit all complete ones.
-      while (this.collecting) {
-        const eoi = indexOfMarker(this.buf, 0xff, 0xd9);
-        if (eoi === -1) break;
-        const frame = this.buf.subarray(0, eoi + 2);
-        frames.push(frame);
-        const rest = this.buf.subarray(eoi + 2);
-        this.collecting = false;
-        this.buf = Buffer.alloc(0);
-        if (rest.length > 0) {
-          data = rest;
+      // EOI split across chunk boundary: previous ended with 0xff, new begins with 0xd9.
+      if (this.prevByte === 0xff && data[0] === 0xd9) {
+        this._pushFrameChunk(data.subarray(0, 1));
+        if (this.totalBytes > this.maxFrameBytes) {
+          this._resetFrame();
           break;
         }
+        frames.push(this._finishFrame());
+        data = data.subarray(1);
+        continue;
+      }
+
+      const eoi = indexOfMarker(data, 0xff, 0xd9);
+      if (eoi === -1) {
+        this._pushFrameChunk(data);
+        if (this.totalBytes > this.maxFrameBytes) {
+          this._resetFrame();
+          break;
+        }
+        data = EMPTY;
+      } else {
+        const end = eoi + 2;
+        this._pushFrameChunk(data.subarray(0, end));
+        if (this.totalBytes > this.maxFrameBytes) {
+          this._resetFrame();
+          break;
+        }
+        frames.push(this._finishFrame());
+        data = data.subarray(end);
       }
     }
 
@@ -71,31 +193,31 @@ class JpegAssembler {
 class PcapStreamParser {
   constructor(onPacket) {
     this.onPacket = onPacket;
-    this.buf = Buffer.alloc(0);
+    this.q = new ByteQueue();
     this.pcap = null;
     this.debug = process.env.SUEAR_DEBUG === '1';
   }
 
   need(n) {
-    return this.buf.length >= n;
+    return this.q.length >= n;
   }
 
   drain(n) {
-    this.buf = this.buf.subarray(n);
+    this.q.drain(n);
   }
 
   readU32(off, le) {
-    return le ? this.buf.readUInt32LE(off) : this.buf.readUInt32BE(off);
+    return le ? this.q.readUInt32LE(off) : this.q.readUInt32BE(off);
   }
 
   stripTcpdumpBanner() {
     // Android tcpdump sometimes writes its "listening on ..." banner to stdout,
     // which corrupts the binary pcap stream. Strip any leading ASCII line(s)
     // starting with "tcpdump:".
-    while (this.buf.length >= 8 && this.buf.subarray(0, 8).toString('ascii') === 'tcpdump:') {
-      const nl = this.buf.indexOf(0x0a);
+    while (this.q.length >= 8 && this.q.peek(8).toString('ascii') === 'tcpdump:') {
+      const nl = this.q.indexOf(0x0a);
       if (nl === -1) return false; // need more bytes
-      this.buf = this.buf.subarray(nl + 1);
+      this.q.drain(nl + 1);
     }
     return true;
   }
@@ -103,28 +225,28 @@ class PcapStreamParser {
   tryResync(le) {
     // Scan forward a bit for a plausible per-packet header.
     // header: ts_sec(u32), ts_usec(u32), incl_len(u32), orig_len(u32)
-    const maxScan = Math.min(this.buf.length - 16, 4096);
+    const maxScan = Math.min(this.q.length - 16, 4096);
     for (let i = 0; i <= maxScan; i++) {
-      const tsUsec = le ? this.buf.readUInt32LE(i + 4) : this.buf.readUInt32BE(i + 4);
-      const inclLen = le ? this.buf.readUInt32LE(i + 8) : this.buf.readUInt32BE(i + 8);
-      const origLen = le ? this.buf.readUInt32LE(i + 12) : this.buf.readUInt32BE(i + 12);
+      const tsUsec = this.readU32(i + 4, le);
+      const inclLen = this.readU32(i + 8, le);
+      const origLen = this.readU32(i + 12, le);
       if (tsUsec > 1_000_000) continue;
       if (inclLen !== origLen) continue;
       if (inclLen < 14 || inclLen > 262_144) continue;
       if (i !== 0 && this.debug) console.log(`[pcap] resync +${i} (inclLen=${inclLen})`);
-      this.buf = this.buf.subarray(i);
+      this.drain(i);
       return true;
     }
     return false;
   }
 
   push(data) {
-    this.buf = Buffer.concat([this.buf, data]);
+    this.q.push(data);
 
     if (!this.pcap) {
       if (!this.need(24)) return;
-      const magicBE = this.buf.readUInt32BE(0);
-      const magicLE = this.buf.readUInt32LE(0);
+      const magicBE = this.q.readUInt32BE(0);
+      const magicLE = this.q.readUInt32LE(0);
       let le = null;
       // microsecond-resolution PCAP (common)
       if (magicBE === 0xa1b2c3d4) le = false;
@@ -134,7 +256,7 @@ class PcapStreamParser {
       else if (magicLE === 0xa1b23c4d) le = true;
       else throw new Error(`Unknown pcap magic: be=0x${magicBE.toString(16)} le=0x${magicLE.toString(16)}`);
 
-      const network = le ? this.buf.readUInt32LE(20) : this.buf.readUInt32BE(20);
+      const network = le ? this.q.readUInt32LE(20) : this.q.readUInt32BE(20);
       this.pcap = { le, network };
       if (this.pcap.network !== 1) {
         throw new Error(`Unsupported pcap linktype=${this.pcap.network} (expected 1/EN10MB).`);
@@ -154,7 +276,7 @@ class PcapStreamParser {
       if (tsUsec > 1_000_000 || inclLen !== origLen || inclLen < 14 || inclLen > 262_144) {
         if (!this.tryResync(le)) {
           if (this.debug) {
-            const preview = this.buf.subarray(0, Math.min(this.buf.length, 64));
+            const preview = this.q.peek(Math.min(this.q.length, 64));
             console.log(`[pcap] desync (tsUsec=${tsUsec} incl=${inclLen} orig=${origLen}) next=${preview.toString('hex')}`);
           }
           return;
@@ -162,7 +284,7 @@ class PcapStreamParser {
         continue;
       }
       if (!this.need(16 + inclLen)) return;
-      const pkt = this.buf.subarray(16, 16 + inclLen);
+      const pkt = this.q.subarray(16, 16 + inclLen);
       this.drain(16 + inclLen);
       this.onPacket(pkt);
     }
@@ -294,7 +416,9 @@ function start() {
     if (soi >= 0 && soi <= 64) payload = payload.subarray(soi);
     else if (payload.length > 16) payload = payload.subarray(16);
 
-    const frames = assembler.feed(payload);
+    // `payload` is a slice into `pkt`, which may reference internal parser storage.
+    // Copy to ensure stable bytes while the assembler buffers chunks and while writes are pending.
+    const frames = assembler.feed(Buffer.from(payload));
     for (const f of frames) {
       frameCount++;
       assembledFrames++;
