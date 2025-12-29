@@ -14,6 +14,21 @@ Streams the Suear live-preview video over USB by capturing the phone’s UDP tra
 
 This avoids trying to forward UDP directly (ADB port forwarding is TCP/Unix-socket only).
 
+## Code layout / pipeline
+
+The parsing path is implemented as a small Node.js Transform-stream pipeline:
+
+`pcap bytes` → `pcap packets` → `udp datagrams` → `suear payload bytes` → `jpeg frames`
+
+Modules:
+
+- `bin/index.js`: entrypoint; ADB/tcpdump orchestration + MJPEG HTTP server.
+- `lib/pcap-parser.js`: PCAP parsing (`PcapStreamParser`) + stream wrapper (`PcapParserTransform`).
+- `lib/udp-decoder.js`: Ethernet/IPv4/UDP decode + stream wrapper (`UdpDecoderTransform`).
+- `lib/suear-payload.js`: Suear-specific filtering (src IP/port) and payload header stripping (`SuearPayloadTransform`).
+- `lib/jpeg-assembler.js`: JPEG frame reassembly (`JpegAssembler`) + stream wrapper (`JpegAssemblerTransform`).
+- `lib/byte-queue.js`, `lib/buffer-utils.js`: internal buffer helpers.
+
 ## Prereqs
 
 - `adb` working (USB debugging enabled).
